@@ -1,0 +1,53 @@
+# Autonomous CPU worker for the LLM gateway — runs on GitHub Actions.
+#
+# PUBLIC repo → UNLIMITED free Actions minutes → genuinely 24/7, self-relaunching at €0.
+# DEGRADED mode: Ollama-CPU + a small model (qwen2.5:3b). Not fast, but it is the
+# guaranteed floor that drains the gateway queue when all GPU platforms are down.
+# Runs on cron (~every 4h) for ~340 min (under the 6h hard job cap), then the cron
+# re-invokes it → an auto-restarting worker with zero manual intervention.
+#
+# SETUP:
+#   Repo → Settings → Secrets and variables → Actions → New secret: GATEWAY_TOKEN
+#   (No secret ever lives in code — it is injected from the Actions secret at runtime.)
+name: gpu-worker-cpu-failover
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"     # every 4 hours → self-relaunch
+  workflow_dispatch: {}        # manual on-demand start
+
+concurrency:
+  group: gpu-worker-cpu
+  cancel-in-progress: false
+
+jobs:
+  drain-queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350       # < 360 (GitHub Actions hard job cap)
+    env:
+      GATEWAY_TOKEN: ${{ secrets.GATEWAY_TOKEN }}
+      LLM_GATEWAY: https://milita-llm.duckdns.org/v1
+      GPU_MODEL: qwen2.5:3b     # small: runs acceptably on CPU
+      WORKER_ID_PREFIX: gha-cpu
+      RUN_SECONDS: "20400"      # ~340 min, margin under timeout-minutes
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ollama (CPU)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd pciutils
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve >/tmp/ollama.log 2>&1 &
+          sleep 6
+          ollama pull "$GPU_MODEL"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run CPU worker (drain the queue until time runs out)
+        run: |
+          pip install --quiet requests
+          python gha_cpu_worker.py
